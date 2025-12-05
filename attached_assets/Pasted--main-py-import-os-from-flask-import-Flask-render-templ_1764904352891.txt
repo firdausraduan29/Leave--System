@@ -1,0 +1,305 @@
+# main.py
+import os
+from flask import Flask, render_template, request, redirect, url_for, flash, session, send_from_directory
+from authlib.integrations.flask_client import OAuth
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user, UserMixin
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, date
+import uuid
+
+# ---------- Config ----------
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY") or "dev-secret-key-change-this"
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+db_path = os.path.join(BASE_DIR, "data.db")
+app.config['SQLALCHEMY_DATABASE_URI'] = "sqlite:///" + db_path
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
+
+# OAuth (Google)
+oauth = OAuth(app)
+CONF_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+CONF_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+if CONF_CLIENT_ID and CONF_CLIENT_SECRET:
+    oauth.register(
+        name='google',
+        client_id=CONF_CLIENT_ID,
+        client_secret=CONF_CLIENT_SECRET,
+        access_token_url='https://oauth2.googleapis.com/token',
+        access_token_params=None,
+        authorize_url='https://accounts.google.com/o/oauth2/v2/auth',
+        authorize_params=None,
+        api_base_url='https://www.googleapis.com/oauth2/v1/',
+        client_kwargs={'scope': 'openid email profile'}
+    )
+
+# ---------- Models ----------
+class User(db.Model, UserMixin):
+    id = db.Column(db.String(36), primary_key=True)  # uuid
+    email = db.Column(db.String(200), unique=True, nullable=False)
+    name = db.Column(db.String(200))
+    role = db.Column(db.String(50), default="Employee")  # Employee / HR / Boss / Admin
+    password_hash = db.Column(db.String(300), nullable=True)  # optional
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def get_id(self):
+        return self.id
+
+class LeaveRequest(db.Model):
+    id = db.Column(db.String(36), primary_key=True)
+    employee_id = db.Column(db.String(36), db.ForeignKey('user.id'))
+    leave_type = db.Column(db.String(50))
+    start_date = db.Column(db.Date)
+    end_date = db.Column(db.Date)
+    total_days = db.Column(db.Float)
+    reason = db.Column(db.Text)
+    mc_link = db.Column(db.String(500))  # filename or URL
+    status = db.Column(db.String(50), default="Pending") # Pending / HR Approved / Boss Approved / Rejected
+    hr_comment = db.Column(db.Text, nullable=True)
+    boss_comment = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class LeaveBalance(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.String(36), db.ForeignKey('user.id'))
+    annual = db.Column(db.Float, default=0.0)
+    medical = db.Column(db.Float, default=0.0)
+    emergency = db.Column(db.Float, default=0.0)
+    unpaid = db.Column(db.Float, default=0.0)
+    maternity = db.Column(db.Float, default=0.0)
+
+# ---------- Login Manager ----------
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(user_id)
+
+# ---------- Helpers ----------
+def create_user_if_not_exists(email, name=None, role="Employee"):
+    u = User.query.filter_by(email=email).first()
+    if not u:
+        u = User(id=str(uuid.uuid4()), email=email, name=name or email.split("@")[0], role=role)
+        db.session.add(u)
+        db.session.commit()
+        # default leave balances (example)
+        lb = LeaveBalance(user_id=u.id, annual=12.0, medical=14.0, emergency=3.0, unpaid=0.0, maternity=60.0)
+        db.session.add(lb)
+        db.session.commit()
+    return u
+
+def calculate_total_days(start, end):
+    # inclusive days; simple example excluding weekends optional later
+    return (end - start).days + 1
+
+# ---------- Routes ----------
+@app.route("/")
+def index():
+    return render_template("index.html", user=current_user if current_user.is_authenticated else None)
+
+# Simple login page (fallback)
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        # simple username/password fallback
+        email = request.form.get("email")
+        pwd = request.form.get("password")
+        u = User.query.filter_by(email=email).first()
+        if u and u.password_hash and check_password_hash(u.password_hash, pwd):
+            login_user(u)
+            flash("Logged in (fallback).", "success")
+            return redirect(url_for("dashboard"))
+        flash("Invalid credentials.", "danger")
+    return render_template("login.html")
+
+# Google OAuth route
+@app.route("/login/google")
+def login_google():
+    if not (CONF_CLIENT_ID and CONF_CLIENT_SECRET):
+        flash("Google OAuth not configured. Use fallback login or set GOOGLE_CLIENT_ID & SECRET.", "warning")
+        return redirect(url_for("login"))
+    redirect_uri = url_for('auth', _external=True)
+    return oauth.google.authorize_redirect(redirect_uri)
+
+@app.route("/auth")
+def auth():
+    token = oauth.google.authorize_access_token()
+    user_info = oauth.google.parse_id_token(token)
+    email = user_info.get("email")
+    name = user_info.get("name")
+    # create user if not exists, default role is Employee (admin can change role later)
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        # For demo: allow specific emails to become HR/Boss if you want to pre-seed.
+        # else default Employee
+        role = "Employee"
+        # If you want to auto-assign boss/hr by email domain or specific emails, do here.
+        user = User(id=str(uuid.uuid4()), email=email, name=name, role=role)
+        db.session.add(user)
+        db.session.commit()
+        # create leave balance
+        lb = LeaveBalance(user_id=user.id, annual=12.0, medical=14.0, emergency=3.0, unpaid=0.0, maternity=60.0)
+        db.session.add(lb)
+        db.session.commit()
+
+    login_user(user)
+    flash(f"Logged in as {user.name}", "success")
+    return redirect(url_for("dashboard"))
+
+@app.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    flash("Logged out.", "info")
+    return redirect(url_for("index"))
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    # show different view based on role
+    if current_user.role == "Employee":
+        leaves = LeaveRequest.query.filter_by(employee_id=current_user.id).order_by(LeaveRequest.created_at.desc()).all()
+        balances = LeaveBalance.query.filter_by(user_id=current_user.id).first()
+        return render_template("dashboard_employee.html", leaves=leaves, balances=balances)
+    elif current_user.role == "HR":
+        pending = LeaveRequest.query.filter(LeaveRequest.status=="Pending").order_by(LeaveRequest.created_at.desc()).all()
+        return render_template("dashboard_hr.html", pending=pending)
+    elif current_user.role == "Boss":
+        to_review = LeaveRequest.query.filter(LeaveRequest.status=="HR Approved").order_by(LeaveRequest.created_at.desc()).all()
+        return render_template("dashboard_boss.html", to_review=to_review)
+    else:
+        # Admin
+        all_requests = LeaveRequest.query.order_by(LeaveRequest.created_at.desc()).all()
+        users = User.query.all()
+        return render_template("dashboard_admin.html", requests=all_requests, users=users)
+
+@app.route("/apply", methods=["GET", "POST"])
+@login_required
+def apply():
+    if request.method == "POST":
+        lt = request.form.get("leave_type")
+        start = datetime.strptime(request.form.get("start_date"), "%Y-%m-%d").date()
+        end = datetime.strptime(request.form.get("end_date"), "%Y-%m-%d").date()
+        reason = request.form.get("reason")
+        # handle file upload (simple)
+        mc_link = None
+        file = request.files.get("mc_file")
+        if file and file.filename:
+            filename = f"uploads/{uuid.uuid4().hex}_{file.filename}"
+            os.makedirs(os.path.join(BASE_DIR, "uploads"), exist_ok=True)
+            file.save(os.path.join(BASE_DIR, filename))
+            mc_link = "/" + filename  # serve via route
+        total = calculate_total_days(start, end)
+        lr = LeaveRequest(id=str(uuid.uuid4()), employee_id=current_user.id, leave_type=lt,
+                          start_date=start, end_date=end, total_days=total, reason=reason, mc_link=mc_link)
+        db.session.add(lr)
+        db.session.commit()
+        flash("Leave request submitted.", "success")
+        return redirect(url_for("dashboard"))
+    return render_template("apply.html")
+
+@app.route('/uploads/<path:filename>')
+def uploaded_file(filename):
+    return send_from_directory(BASE_DIR, filename)
+
+# HR approves (moves to HR Approved)
+@app.route("/hr/approve/<req_id>", methods=["POST"])
+@login_required
+def hr_approve(req_id):
+    if current_user.role not in ["HR", "Admin"]:
+        flash("Not authorized.", "danger")
+        return redirect(url_for("dashboard"))
+    lr = LeaveRequest.query.get(req_id)
+    if not lr:
+        flash("Request not found.", "danger")
+        return redirect(url_for("dashboard"))
+    action = request.form.get("action")
+    comment = request.form.get("hr_comment")
+    if action == "approve":
+        lr.status = "HR Approved"
+        lr.hr_comment = comment
+    else:
+        lr.status = "Rejected"
+        lr.hr_comment = comment
+    db.session.commit()
+    flash("HR action recorded.", "success")
+    return redirect(url_for("dashboard"))
+
+# Boss final approval
+@app.route("/boss/approve/<req_id>", methods=["POST"])
+@login_required
+def boss_approve(req_id):
+    if current_user.role not in ["Boss", "Admin"]:
+        flash("Not authorized.", "danger")
+        return redirect(url_for("dashboard"))
+    lr = LeaveRequest.query.get(req_id)
+    if not lr:
+        flash("Request not found.", "danger")
+        return redirect(url_for("dashboard"))
+    action = request.form.get("action")
+    comment = request.form.get("boss_comment")
+    if action == "approve":
+        lr.status = "Boss Approved"
+        lr.boss_comment = comment
+        # Deduct from leave balance automatically (simple)
+        lb = LeaveBalance.query.filter_by(user_id=lr.employee_id).first()
+        if lb:
+            if lr.leave_type == "Annual":
+                lb.annual = max(0, lb.annual - lr.total_days)
+            elif lr.leave_type == "Medical":
+                lb.medical = max(0, lb.medical - lr.total_days)
+            elif lr.leave_type == "Emergency":
+                lb.emergency = max(0, lb.emergency - lr.total_days)
+            elif lr.leave_type == "Unpaid":
+                lb.unpaid = lb.unpaid + lr.total_days
+            elif lr.leave_type == "Maternity":
+                lb.maternity = max(0, lb.maternity - lr.total_days)
+            db.session.commit()
+    else:
+        lr.status = "Rejected"
+        lr.boss_comment = comment
+        db.session.commit()
+    flash("Boss action recorded.", "success")
+    return redirect(url_for("dashboard"))
+
+# Admin: Create initial accounts or change roles
+@app.route("/admin/setup", methods=["GET", "POST"])
+def admin_setup():
+    # This is a simple setup page to create initial HR/Boss accounts and/or set passwords
+    # In production, protect this route
+    if request.method == "POST":
+        email = request.form.get("email")
+        name = request.form.get("name")
+        role = request.form.get("role")
+        pwd = request.form.get("password")
+        u = User.query.filter_by(email=email).first()
+        if not u:
+            u = User(id=str(uuid.uuid4()), email=email, name=name, role=role)
+            db.session.add(u)
+            db.session.commit()
+            lb = LeaveBalance(user_id=u.id, annual=12.0, medical=14.0, emergency=3.0, unpaid=0.0, maternity=60.0)
+            db.session.add(lb)
+            db.session.commit()
+        if pwd:
+            u.password_hash = generate_password_hash(pwd)
+            db.session.commit()
+        flash("User created/updated.", "success")
+    return render_template("admin_setup.html")
+
+# Simple route to list all users (admin)
+@app.route("/admin/users")
+@login_required
+def admin_users():
+    if current_user.role != "Admin":
+        flash("Not authorized.", "danger")
+        return redirect(url_for("dashboard"))
+    users = User.query.all()
+    return render_template("admin_users.html", users=users)
+
+# --------- Init DB helper ---------
+@app.cli.command("initdb")
+def initdb():
+    db.create_all()
+    print("DB created.")
